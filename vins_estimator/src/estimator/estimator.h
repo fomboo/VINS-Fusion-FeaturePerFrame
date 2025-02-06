@@ -174,4 +174,35 @@ class Estimator
 
     bool initFirstPoseFlag;
     bool initThreadFlag;
+
+    void updateFrameDepth_05();
+     // 声明 saveDepthToFile 函数
+    void saveDepthTocsvFile(const std::string& filename);
+
+    // **************** 新增数据结构，用于保存每一帧的特征点像素坐标和深度 ****************
+
+        // 保存单个特征点的信息：feature id, 像素坐标 (u,v) 和深度（初始时置为 -1）
+    struct FrameFeature {
+        int feature_id;   // 特征点的全局编号（由 featuretracker 分配）
+        double u;         // 像素 u 坐标
+        double v;         // 像素 v 坐标
+        double depth;     // 特征点在当前帧的深度
+
+        // 构造函数，默认 u,v,depth 均置为 -1
+        FrameFeature(int id, double u_val = -1, double v_val = -1, double depth_val = -1)
+            : feature_id(id), u(u_val), v(v_val), depth(depth_val) {} //冒号后面作用是直接初始化赋值成员变量，不需要默认构造再赋值
+    };
+
+        // 保存单帧图像的所有特征点信息，采用图像帧的全局编号作为标识（header 时间戳）
+    struct FrameDataDepth {
+        double header;  // 全局帧编号，取自图像消息 header.stamp.toSec()
+        vector<FrameFeature> features;  // 本帧上所有特征点的信息
+
+        // 构造函数，传入当前帧的 header
+        FrameDataDepth(double h) : header(h) {}
+    };
+
+    // 新增容器：用全局帧 header（时间戳）作为 key 保存每一帧的特征点深度信息
+    std::map<double, FrameDataDepth> frame_data_depths;
+
 };

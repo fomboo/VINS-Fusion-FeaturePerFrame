@@ -10,6 +10,10 @@
 #include "estimator.h"
 #include "../utility/visualization.h"
 
+#include <fstream>
+#include <iostream>
+#include <iomanip>
+
 Estimator::Estimator(): f_manager{Rs}
 {
     ROS_INFO("init begins");
@@ -164,7 +168,7 @@ void Estimator::inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1)
     TicToc featureTrackerTime;
 
     if(_img1.empty())
-        featureFrame = featureTracker.trackImage(t, _img);
+        featureFrame = featureTracker.trackImage(t, _img);//timestamp 是由图像的 ros::Time生成，Estimator::inputImage 中，t（时间戳）作为参数传递给featureTracker.trackImage 和 updateFrameDepth函数进行处理
     else
         featureFrame = featureTracker.trackImage(t, _img, _img1);
     //printf("featureTracker time: %f\n", featureTrackerTime.toc());
@@ -427,6 +431,20 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     ROS_DEBUG("Solving %d", frame_count);
     ROS_DEBUG("number of feature: %d", f_manager.getFeatureCount());
     Headers[frame_count] = header;
+
+    // ===== 新增代码：为当前图像帧分配全局序号并初始化该帧的特征深度数据 =====
+        // 使用当前帧的 header（即时间戳）作为全局编号
+        // 构造一个 FrameDataDepth 对象，并遍历 image 中每个特征，将其 feature_id 添加到该对象中
+    FrameDataDepth newFrameData(header);
+    for (auto &feat_pair : image) {
+        int feature_id = feat_pair.first; // image 的 key 为 feature id
+        // 将每个特征点加入 newFrameData.features，像素坐标和深度初始置为 -1
+        newFrameData.features.push_back(FrameFeature(feature_id));
+    }
+    // 将新建的 FrameDataDepth 对象插入到全局容器 frame_data_depths 中; 
+    //✅newFrameData是局部变量，当processImage()函数结束时会被自动销毁（出栈），所以在新帧插入的循环中newFrameData会被反复创建销毁
+    frame_data_depths.insert(std::make_pair(header, newFrameData));
+    // =======================================================================
 
     ImageFrame imageframe(image, header);
     imageframe.pre_integration = tmp_pre_integration;
@@ -1133,6 +1151,8 @@ void Estimator::optimization()
     double2vector();
     //printf("frame_count: %d \n", frame_count);
 
+    updateFrameDepth_05();// After optimization, update the depth for each frame and feature point
+
     if(frame_count < WINDOW_SIZE)
         return;
     
@@ -1608,4 +1628,146 @@ void Estimator::updateLatestStates()
         tmp_gyrBuf.pop();
     }
     mPropagate.unlock();
+}
+
+/**************** 新增：更新滑窗内每帧特征点的深度信息 ****************
+ * 遍历滑动窗口内所有图像帧（由 Headers 数组给出），
+ * 对每帧中存储的每个特征点，根据以下步骤计算该特征在当前帧的深度：
+ *   1. 根据 feature id 在 f_manager.feature 中查找对应的特征信息，
+ *      取得该特征的起始帧（start_frame）、在起始帧上的像素坐标以及初始估计的深度（计算逆深度 lambda）。
+ *   2. 利用当前帧的相对索引（即当前帧在滑窗中的序号与特征的 start_frame 之差）确定当前帧上的观测（像素坐标）。
+ *   3. 从 all_image_frame 中获取起始帧和当前帧的位姿（旋转 R 和平移 T）。
+ *   4. 根据起始帧上像素坐标和逆深度计算出 3D 点在起始帧下的坐标，
+ *      然后转换到世界坐标，再转换到当前帧坐标系，得到该 3D 点的 z 值作为深度。
+ *   5. 更新当前帧对应 FrameDataDepth 中的该特征的像素坐标和深度信息。
+ */
+void Estimator::updateFrameDepth_05()
+{
+    // 遍历滑窗内所有帧，窗口中帧的全局编号保存在 Headers 数组中（索引 0 ~ frame_count）
+    for (int i = 0; i <= frame_count; i++) {
+        double frame_header = Headers[i];
+        
+        // 如果当前帧对应的 FrameDataDepth 数据不存在，则跳过更新
+        if (frame_data_depths.find(frame_header) == frame_data_depths.end())
+            continue;
+        
+        Matrix3d R_current = Rs[i];  // 从 Rs[] 获取优化后的旋转矩阵
+        Vector3d T_current = Ps[i];  // 从 Ps[] 获取优化后的平移向量
+                // old version（我发现gpt误解了all_image_frame功能，并不是每一次的优化后都会更新，所以还是选择Rs和Ps）
+                // 从 all_image_frame 中获取当前帧的位姿信息
+                // // all_image_frame 的 key 即为图像消息 header，对应当前帧的全局编号
+                // if (all_image_frame.find(frame_header) == all_image_frame.end())//map<double, ImageFrame> all_image_frame
+                //     continue;
+                // ImageFrame currFrame = all_image_frame[frame_header];//Ps[]、Rs[]、Vs[]、Bas[]、Bgs[]这些数组都是在class Estimator {public中作为类的成员变量定义的，数组的大小都是 WINDOW_SIZE + 1
+                // Matrix3d R_current = currFrame.R;
+                // Vector3d T_current = currFrame.T;
+        
+        // 遍历当前帧所有特征点记录，逐个更新像素坐标和深度信息
+        for (auto &frameFeat : frame_data_depths[frame_header].features) {
+            int feat_id = frameFeat.feature_id;
+            bool found = false;
+            
+            // 在 f_manager.feature 中查找该特征（FeaturePerId）
+            for (auto &feat : f_manager.feature) {
+                if (feat.feature_id == feat_id) {
+                    found = true;
+                    int start_idx = feat.start_frame;  // 该特征的初始观测帧索引
+                    // 计算当前帧在该特征的观测序列中的索引
+                    int curr_obs_idx = i - start_idx;//i是当前帧的窗口索引，start_idx是特征点起始帧的窗口索引，curr_obs_idx对应查询第几条观测记录
+                    // 检查当前帧是否处于该特征的观测序列内
+                    if (curr_obs_idx < 0 || curr_obs_idx >= feat.feature_per_frame.size())
+                        break;  // 当前帧没有观测到该特征
+                    
+                    // 获取起始帧上该特征的像素坐标（u, v）
+                    double u_start = feat.feature_per_frame[0].uv.x();//这个feature_per_frame是FeaturePerID级别的存储结构, 0就对应最初的那条观测记录
+                    double v_start = feat.feature_per_frame[0].uv.y();
+                    // 获取当前帧上该特征的像素坐标（更新后的观测，可能已由 featuretracker 更新）
+                    double u_curr = feat.feature_per_frame[curr_obs_idx].uv.x();
+                    double v_curr = feat.feature_per_frame[curr_obs_idx].uv.y();
+               
+                    Matrix3d R_start = Rs[start_idx];  // 从 Rs[] 获取优化后的旋转矩阵
+                    Vector3d T_start = Ps[start_idx];  // 从 Ps[] 获取优化后的平移向量
+                            // old version（我发现gpt误解了all_image_frame功能，并不是每一次的优化后都会更新，所以还是选择Rs和Ps）
+                            // 从 all_image_frame 中获取初始帧的位姿信息
+                            // // 注意：初始帧的全局编号存储在 Headers[start_idx]
+                            // double start_header = Headers[start_idx];
+                            // if (all_image_frame.find(start_header) == all_image_frame.end())
+                            //     break;
+                            // ImageFrame startFrame = all_image_frame[start_header];
+                            // Matrix3d R_start = startFrame.R;
+                            // Vector3d T_start = startFrame.T;
+
+                    // 取得初始观测时的深度估计，计算逆深度 lambda
+                    double lambda = -1;
+                    if (feat.estimated_depth > 0)
+                        lambda = 1.0 / feat.estimated_depth;
+                    else
+                        lambda = -1;
+                    
+                    // 如果逆深度无效，则不更新
+                    if (lambda < 0)
+                        break;
+                    
+                    // 假设像素坐标已归一化（或内参已补偿），则利用初始帧上像素坐标和逆深度计算 3D 坐标
+                    // 在计算 3D 坐标时，直接使用了“归一化像素坐标”假设（即认为 [u, v, 1]），实际项目需要利用相机内参（K）进行反投影，请在计算时加入内参矩阵的逆
+                    // 公式：X_start = lambda * [u_start, v_start, 1]^T
+                    Vector3d X_start = lambda * Vector3d(u_start, v_start, 1.0);
+                    // 将该 3D 点从初始帧坐标转换到世界坐标
+                    Vector3d X_world = R_start * X_start + T_start;
+                    // 再将世界坐标转换到当前帧坐标系中：X_current = R_current^T * (X_world - T_current)
+                    Vector3d X_current = R_current.transpose() * (X_world - T_current);
+                    // 特征在当前帧的深度即为 X_current 的 z 分量
+                    double depth_curr = X_current.z();
+                    
+                    // 更新当前帧记录中该特征的像素坐标和深度
+                    frameFeat.u = u_curr;
+                    frameFeat.v = v_curr;
+                    frameFeat.depth = depth_curr;
+                    
+                    break;  // 找到该特征后退出内层循环
+                }
+            }
+            if (!found) {
+                // 若在 f_manager.feature 中未找到该 feature_id，则打印调试信息
+                ROS_WARN("updateFrameDepth: feature id %d not found!", feat_id);
+            }
+        }
+    }
+    // 调用保存函数，保存深度数据到文件
+    saveDepthTocsvFile("/path/to/output/depth_data.csv");
+}
+
+void Estimator::saveDepthTocsvFile(const std::string& filename) {
+    // 打开文件
+    std::ofstream out(filename);
+    
+    // 如果文件未打开，输出错误信息并返回
+    if (!out.is_open()) {
+        std::cerr << "Failed to open file for saving depth data!" << std::endl;
+        return;
+    }
+
+    // 写入 CSV 文件的表头
+    out << "header,feature_id,depth,u,v\n";
+    
+    // 遍历所有帧数据
+    for (const auto& frame_data : frame_data_depths) {
+        double header = frame_data.first;
+        const FrameDataDepth& data = frame_data.second;
+
+        // 遍历该帧中的所有特征
+        for (const auto& feat : data.features) {
+            // 输出每个特征点的深度信息，按 CSV 格式
+            out << std::fixed << std::setprecision(6)  // 设置小数精度
+                << header << ","
+                << feat.feature_id << ","
+                << feat.depth << ","
+                << feat.u << ","
+                << feat.v << "\n";
+        }
+    }
+
+    // 关闭文件
+    out.close();
+    ROS_INFO("Depth data saved to %s", filename.c_str());
 }
